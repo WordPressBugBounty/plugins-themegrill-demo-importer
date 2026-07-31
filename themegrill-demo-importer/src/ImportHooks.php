@@ -4,6 +4,7 @@ namespace ThemeGrill\Demo\Importer;
 
 use ThemeGrill\Demo\Importer\Traits\Singleton;
 use WP_Query;
+use WP_REST_Request;
 
 class ImportHooks {
 	use Singleton;
@@ -29,6 +30,7 @@ class ImportHooks {
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_blockart_blocks_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_elementor_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'process_evf_posts' ) );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'setup_allfeedback_survey' ), 10, 2 );
 
 		add_filter( 'themegrill_widget_import_settings', array( $this, 'update_widget_data' ), 10, 2 );
 		// Disable Masteriyo setup wizard.
@@ -530,6 +532,393 @@ class ImportHooks {
 		update_option( '_blockart_settings', $settings );
 	}
 
+	/**
+	 * Suppress AllFeedback's post-activation Setup Wizard redirect, and create a
+	 * curated popup survey for demos that request one.
+	 *
+	 * AllFeedback stores surveys in its own database table (`{$wpdb->prefix}af_surveys`),
+	 * not a post type, so a survey can't ride along with the WXR content import the way
+	 * Everest Forms forms do (see `process_evf_posts()`/`update_evf_form_ids()` above) —
+	 * there is no "old ID" in the import stream to remap. Instead, this creates the survey
+	 * directly through AllFeedback's own REST controllers via `rest_do_request()`, which
+	 * keeps this integration decoupled from AllFeedback's internal domain/service classes
+	 * and reuses its own request validation (allowed field-type/trigger/position enums, etc.)
+	 * rather than duplicating it here.
+	 *
+	 * Expects `$data['allfeedback_survey']` with at least a `title`. `form_schema`,
+	 * `settings`, and `styling` are optional and merged over sensible defaults, so the
+	 * demo payload only needs to specify what's actually curated per demo (e.g. the
+	 * survey copy) — see `default_allfeedback_form_schema()`, `default_allfeedback_settings()`,
+	 * and `default_allfeedback_styling()` below for what "sensible defaults" means.
+	 *
+	 * @param string $id   Demo Id.
+	 * @param array  $data Demo data.
+	 * @return void
+	 */
+	public function setup_allfeedback_survey( $id, $data ) {
+		if ( ! function_exists( 'is_plugin_active' ) ) {
+			include_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		if ( ! is_plugin_active( 'allfeedback/allfeedback.php' ) ) {
+			return;
+		}
+
+		// AllFeedback redirects to its Setup Wizard on the next admin page load after activation, so mark it completed to suppress that redirect.
+		update_option( 'allfeedback_wizard_status', 'completed' );
+
+		$survey_data = $data['allfeedback_survey'] ?? $this->default_allfeedback_survey_for_demo( $id );
+
+		if ( empty( $survey_data['title'] ) ) {
+			return;
+		}
+
+		$create_request = $this->build_json_rest_request(
+			'POST',
+			'/allfeedback/v1/surveys',
+			array(
+				'title'       => sanitize_text_field( $survey_data['title'] ),
+				'description' => wp_kses_post( $survey_data['description'] ?? '' ),
+				'form_schema' => $survey_data['form_schema'] ?? $this->default_allfeedback_form_schema(),
+			)
+		);
+
+		$create_response = rest_do_request( $create_request );
+		$created         = $create_response->get_data();
+
+		if ( $create_response->get_status() >= 300 || empty( $created['data']['id'] ) ) {
+			return;
+		}
+
+		$update_request = $this->build_json_rest_request(
+			'PUT',
+			'/allfeedback/v1/surveys/' . (int) $created['data']['id'],
+			array(
+				'settings' => array_merge( $this->default_allfeedback_settings(), $survey_data['settings'] ?? array() ),
+				'styling'  => array_merge( $this->default_allfeedback_styling(), $survey_data['styling'] ?? array() ),
+				'status'   => 'published',
+			)
+		);
+
+		rest_do_request( $update_request );
+	}
+
+	/**
+	 * Build a `WP_REST_Request` with a genuine JSON body.
+	 *
+	 * AllFeedback's `SurveysController::update()` (the `PUT /surveys/{id}`
+	 * handler) only checks whether a field was submitted via
+	 * `$request->get_json_params()` — not the more forgiving `get_param()`
+	 * that merges every parameter source — so `set_body_params()` alone isn't
+	 * enough: it fills the `POST` param store, not the `JSON` one, and every
+	 * `array_key_exists( ..., $body )` check in `update()` then silently
+	 * fails, leaving the survey unchanged (still draft, no styling applied).
+	 * Setting an actual JSON body + content-type makes `get_json_params()`
+	 * parse it as intended.
+	 *
+	 * @param string $method HTTP method.
+	 * @param string $route  REST route.
+	 * @param array  $params Request body params.
+	 * @return WP_REST_Request
+	 */
+	protected function build_json_rest_request( $method, $route, $params ) {
+		$request = new WP_REST_Request( $method, $route );
+		$request->set_header( 'Content-Type', 'application/json' );
+		$request->set_body( wp_json_encode( $params ) );
+
+		return $request;
+	}
+
+	/**
+	 * Per-demo curated AllFeedback survey content (ZAK-238).
+	 *
+	 * Fallback used only when the remote demo payload doesn't itself supply an
+	 * `allfeedback_survey` key — once the demos server is updated to curate a
+	 * given demo directly, its payload takes precedence over the entry here
+	 * (see the `?? ` fallback in `setup_allfeedback_survey()` above). Keyed by
+	 * demo slug; any key not listed here simply gets no survey until it's
+	 * curated on one side or the other.
+	 *
+	 * Each entry only overrides `title`/`form_schema`/`styling`; `settings`
+	 * (trigger/frequency/targeting) keeps the sitewide defaults below unless
+	 * noted otherwise. Content and niche below is based on what's actually live
+	 * on each demo's reference site (zakrademos.com/<slug>), not guessed:
+	 *
+	 * - `agency`   — general creative/digital agency (portfolio, pricing plans,
+	 *                team, client reviews). Client-services, referral-driven.
+	 * - `suffice`  — marketing/growth agency ("Book Now" CTA, services: Marketing,
+	 *                Branding, Web Design, Strategy). Same referral logic as agency.
+	 * - `lawyer`   — law firm (practice areas, case stats, consultations). Also
+	 *                referral-driven professional services; legal-flavoured wording.
+	 * - `charity`  — nonprofit (donations, causes, volunteers). Not a commercial
+	 *                "would you recommend" fit — visitors are donors/volunteers, not
+	 *                clients, so this uses a visitor-intent `radio` question instead
+	 *                of NPS (mirrors AllFeedback's own "customer-research" template).
+	 * - `foodhunt` — restaurant (menu, reservations, dishes). Dining-experience
+	 *                `star_rating` — the one universal restaurant-feedback pattern.
+	 *
+	 * agency/suffice/lawyer all map to NPS (AllFeedback's own flagship survey
+	 * type) because all three are referral-driven client-services businesses;
+	 * the wording differs per niche rather than reusing identical copy.
+	 *
+	 * @param string $id Demo Id/slug.
+	 * @return array
+	 */
+	protected function default_allfeedback_survey_for_demo( $id ) {
+		$curated = array(
+			'agency' => array(
+				'title'       => __( 'How Are We Doing?', 'themegrill-demo-importer' ),
+				'form_schema' => array(
+					'version'  => '1.0',
+					'sections' => array(
+						array(
+							'id'     => 's1',
+							'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+							'fields' => array(
+								array(
+									'id'       => 'f1',
+									'type'     => 'nps',
+									'label'    => __( 'How likely are you to recommend our agency to a friend or colleague?', 'themegrill-demo-importer' ),
+									'required' => true,
+									'settings' => array(),
+								),
+								array(
+									'id'       => 'f2',
+									'type'     => 'long_text',
+									'label'    => __( 'What\'s the main reason for your score?', 'themegrill-demo-importer' ),
+									'required' => false,
+									'settings' => array(
+										'placeholder' => __( 'Tell us what stood out — good or bad…', 'themegrill-demo-importer' ),
+									),
+								),
+							),
+						),
+					),
+				),
+				// Matches this demo's own accent colour (zakra_breadcrumbs_link_hover_color).
+				'styling'     => array(
+					'widget_color' => '#23ab70',
+				),
+			),
+			'suffice' => array(
+				'title'       => __( 'How Are We Doing?', 'themegrill-demo-importer' ),
+				'form_schema' => array(
+					'version'  => '1.0',
+					'sections' => array(
+						array(
+							'id'     => 's1',
+							'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+							'fields' => array(
+								array(
+									'id'       => 'f1',
+									'type'     => 'nps',
+									'label'    => __( 'How likely are you to recommend our marketing services to a friend or colleague?', 'themegrill-demo-importer' ),
+									'required' => true,
+									'settings' => array(),
+								),
+								array(
+									'id'       => 'f2',
+									'type'     => 'long_text',
+									'label'    => __( 'What\'s the main reason for your score?', 'themegrill-demo-importer' ),
+									'required' => false,
+									'settings' => array(
+										'placeholder' => __( 'Tell us what stood out — good or bad…', 'themegrill-demo-importer' ),
+									),
+								),
+							),
+						),
+					),
+				),
+				// Matches this demo's own primary colour (zakra_primary_color).
+				'styling'     => array(
+					'widget_color' => '#3867D6',
+				),
+			),
+			'lawyer' => array(
+				'title'       => __( 'How Are We Doing?', 'themegrill-demo-importer' ),
+				'form_schema' => array(
+					'version'  => '1.0',
+					'sections' => array(
+						array(
+							'id'     => 's1',
+							'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+							'fields' => array(
+								array(
+									'id'       => 'f1',
+									'type'     => 'nps',
+									'label'    => __( 'How likely are you to recommend our law firm to a friend or colleague?', 'themegrill-demo-importer' ),
+									'required' => true,
+									'settings' => array(),
+								),
+								array(
+									'id'       => 'f2',
+									'type'     => 'long_text',
+									'label'    => __( 'What\'s the main reason for your score?', 'themegrill-demo-importer' ),
+									'required' => false,
+									'settings' => array(
+										'placeholder' => __( 'Tell us what stood out — good or bad…', 'themegrill-demo-importer' ),
+									),
+								),
+							),
+						),
+					),
+				),
+				// Matches this demo's own primary colour (zakra_primary_color).
+				'styling'     => array(
+					'widget_color' => '#b89b5e',
+				),
+			),
+			'charity' => array(
+				'title'       => __( 'What Brings You Here?', 'themegrill-demo-importer' ),
+				'form_schema' => array(
+					'version'  => '1.0',
+					'sections' => array(
+						array(
+							'id'     => 's1',
+							'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+							'fields' => array(
+								array(
+									'id'       => 'f1',
+									'type'     => 'radio',
+									'label'    => __( 'What brings you here today?', 'themegrill-demo-importer' ),
+									'required' => true,
+									'settings' => array(
+										'options'     => array(
+											__( 'I want to donate', 'themegrill-demo-importer' ),
+											__( 'I want to volunteer', 'themegrill-demo-importer' ),
+											__( 'Learning about your cause', 'themegrill-demo-importer' ),
+											__( 'Other', 'themegrill-demo-importer' ),
+										),
+										'placeholder' => '',
+									),
+								),
+								array(
+									'id'       => 'f2',
+									'type'     => 'long_text',
+									'label'    => __( 'Anything else you\'d like to share with us?', 'themegrill-demo-importer' ),
+									'required' => false,
+									'settings' => array(
+										'placeholder' => __( 'Your message…', 'themegrill-demo-importer' ),
+									),
+								),
+							),
+						),
+					),
+				),
+				// Matches this demo's own primary colour (zakra_primary_color).
+				'styling'     => array(
+					'widget_color' => '#f96703',
+				),
+			),
+			'foodhunt' => array(
+				'title'       => __( 'How Was Your Visit?', 'themegrill-demo-importer' ),
+				'form_schema' => array(
+					'version'  => '1.0',
+					'sections' => array(
+						array(
+							'id'     => 's1',
+							'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+							'fields' => array(
+								array(
+									'id'       => 'f1',
+									'type'     => 'star_rating',
+									'label'    => __( 'How would you rate your dining experience with us?', 'themegrill-demo-importer' ),
+									'required' => true,
+									'settings' => array(
+										'starRange' => 5,
+										'starScale' => 'star',
+									),
+								),
+								array(
+									'id'       => 'f2',
+									'type'     => 'long_text',
+									'label'    => __( 'Tell us what you loved — or what we could do better.', 'themegrill-demo-importer' ),
+									'required' => false,
+									'settings' => array(
+										'placeholder' => __( 'Your thoughts…', 'themegrill-demo-importer' ),
+									),
+								),
+							),
+						),
+					),
+				),
+				// Matches this demo's own accent colour (zakra_header_button_background_color).
+				'styling'     => array(
+					'widget_color' => '#AE7729',
+				),
+			),
+		);
+
+		return $curated[ $id ] ?? array();
+	}
+
+	/**
+	 * Default AllFeedback form schema used when a demo doesn't supply its own.
+	 *
+	 * A single NPS question — the minimal valid schema AllFeedback's
+	 * `validateFormSchema()` accepts (a `sections[].fields[]` list of
+	 * `{id, type, label, required, settings}`, `type` one of AllFeedback's
+	 * supported field types).
+	 *
+	 * @return array
+	 */
+	protected function default_allfeedback_form_schema() {
+		return array(
+			'version'  => '1.0',
+			'sections' => array(
+				array(
+					'id'     => 's1',
+					'title'  => __( 'Feedback', 'themegrill-demo-importer' ),
+					'fields' => array(
+						array(
+							'id'       => 'f1',
+							'type'     => 'nps',
+							'label'    => __( 'How likely are you to recommend us to a friend or colleague?', 'themegrill-demo-importer' ),
+							'required' => true,
+							'settings' => array(),
+						),
+					),
+				),
+			),
+		);
+	}
+
+	/**
+	 * Default AllFeedback display/behaviour settings used when a demo doesn't
+	 * fully specify its own — merged under whatever the demo payload provides.
+	 *
+	 * Shows once per visitor, after a short delay, sitewide, to avoid nagging
+	 * demo-preview visitors on every page.
+	 *
+	 * @return array
+	 */
+	protected function default_allfeedback_settings() {
+		return array(
+			'trigger_type'      => 'time_delay',
+			'delay_value'       => 8,
+			'delay_unit'        => 'seconds',
+			'display_frequency' => 'once',
+			'user_state'        => 'all',
+			'target_pages'      => 'all',
+		);
+	}
+
+	/**
+	 * Default AllFeedback widget styling used when a demo doesn't fully specify
+	 * its own — merged under whatever the demo payload provides.
+	 *
+	 * `bottom-left` is deliberate: the live-chat/support widget most Zakra demos
+	 * ship with already occupies bottom-right (see ZAK-238).
+	 *
+	 * @return array
+	 */
+	protected function default_allfeedback_styling() {
+		return array(
+			'widget_position' => 'bottom-left',
+			'widget_label'    => __( 'Feedback', 'themegrill-demo-importer' ),
+		);
+	}
+
 	public function update_nav_menu_items() {
 		$menu_locations = get_nav_menu_locations();
 
@@ -618,9 +1007,11 @@ class ImportHooks {
 
 			// Update the post content.
 			wp_update_post(
-				array(
-					'ID'           => $post_id,
-					'post_content' => $post_content,
+				wp_slash(
+					array(
+						'ID'           => $post_id,
+						'post_content' => $post_content,
+					)
 				)
 			);
 		}
