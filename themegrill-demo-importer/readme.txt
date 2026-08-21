@@ -4,7 +4,7 @@ Tags: themegrill, theme demos, demo, importer, one click import
 Requires at least: 5.7
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 2.1.2
+Stable tag: 2.1.3
 License: GPLv3 or later
 License URI: https://www.gnu.org/licenses/gpl-3.0.html
 
@@ -33,6 +33,16 @@ Bugs can be reported either in our support forum or preferably on the [GitHub re
 Yes you can! Join in on our [GitHub repository](https://github.com/themegrill/themegrill-demo-importer/) :)
 
 == Changelog ==
+= 2.1.3 - TBD =
+* Fix - SSRF and arbitrary option update via demo_config (schema validation, safe remote requests, option key restrictions).
+* Fix - Install Companion Elementor from ThemeGrill GitHub ZIP; skip when already active.
+* Fix - Remap Everest Forms shortcodes after import so Contact forms render.
+* Fix - User-friendly import errors, progress bar over 100%, and HTML in plugin feature descriptions.
+* Fix - User Registration & Membership pages and options configured after import.
+* Fix - Prevent a fatal error when another active plugin uses a newer psr/log version than Demo Importer.
+* Fix - WooCommerce product categories import issue.
+* Tweak - Run post-import hooks only when the demo requires them.
+
 = 2.1.2 - 31-07-2026 =
 * Feature - Automatically set up a curated AllFeedback NPS survey after importing a demo (where AllFeedback is active).
 * Fix - Formbricks JavaScript Errors in Browser Console.

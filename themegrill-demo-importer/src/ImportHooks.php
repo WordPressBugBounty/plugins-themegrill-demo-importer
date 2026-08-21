@@ -2,7 +2,9 @@
 
 namespace ThemeGrill\Demo\Importer;
 
+use ThemeGrill\Demo\Importer\Helpers\DemoRequirements;
 use ThemeGrill\Demo\Importer\Traits\Singleton;
+use ThemeGrill\Demo\Importer\Validators\DemoConfigValidator;
 use WP_Query;
 use WP_REST_Request;
 
@@ -18,18 +20,20 @@ class ImportHooks {
 
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_customizer_data' ), 9 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_nav_menu_items' ) );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_elementor_load_fa4_shim' ) );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_elementor_active_kit' ) );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_wc_pages' ) );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_masteriyo_pages' ) );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_siteorigin_settings' ) );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_elementor_load_fa4_shim' ), 10, 2 );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_elementor_active_kit' ), 10, 2 );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_wc_pages' ), 10, 2 );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_masteriyo_pages' ), 10, 2 );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_siteorigin_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'setup_yith_woocommerce_wishlist' ), 10, 2 );
-		add_action( 'themegrill_ajax_demo_imported', array( $this, 'regenerate_elementor_styles' ), 10 );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'regenerate_elementor_styles' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_masteriyo_data' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_magazine_blocks_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_blockart_blocks_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'update_elementor_settings' ), 10, 2 );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'process_evf_posts' ) );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'process_membership_buy_now_posts' ) );
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'process_allcoach_add_to_cart_posts' ) );
 		add_action( 'themegrill_ajax_demo_imported', array( $this, 'setup_allfeedback_survey' ), 10, 2 );
 
 		add_filter( 'themegrill_widget_import_settings', array( $this, 'update_widget_data' ), 10, 2 );
@@ -38,45 +42,9 @@ class ImportHooks {
 
 		// Disable BlockArt redirection.
 		add_filter( 'blockart_activation_redirect', '__return_false' );
-		add_action(
-			'init',
-			function () {
-				if (
-				! in_array( 'elementor/elementor.php', get_option( 'active_plugins', array() ), true ) ||
-				! get_option( 'themegrill_demo_importer_activated_id' )
-				) {
-					return;
-				}
-				if ( defined( 'ELEMENTOR_VERSION' ) && version_compare( ELEMENTOR_VERSION, '3.0.0', '>=' ) ) {
-					$query = new WP_Query(
-						array(
-							'post_type' => 'elementor_library',
-						)
-					);
 
-					$ids = array_map(
-						function ( $post ) {
-							return $post->ID;
-						},
-						$query->posts
-					);
-
-					$found = null;
-
-					foreach ( $ids as $id ) {
-						if ( is_array( get_post_meta( $id, '_elementor_page_settings', true ) ) ) {
-							$found = $id;
-							continue;
-						}
-					}
-
-					if ( $found ) {
-						update_option( 'elementor_active_kit', $found );
-					}
-				}
-			},
-			PHP_INT_MAX
-		);
+		// One-shot fallback: only runs when an Elementor demo import asked for a deferred kit sync.
+		add_action( 'admin_init', array( $this, 'maybe_sync_pending_elementor_kit' ) );
 
 		add_filter(
 			'themegrill_import_post_data_processed',
@@ -109,6 +77,157 @@ class ImportHooks {
 			},
 			9
 		);
+
+		add_action( 'themegrill_ajax_demo_imported', array( $this, 'set_urm_pages' ), 10, 2 );
+	}
+
+	/**
+	 * Whether the demo payload lists a plugin matching any of the given needles.
+	 *
+	 * Plugin keys from the API look like `elementor/elementor.php`.
+	 *
+	 * @param array    $demo_data Demo config.
+	 * @param string[] $needles   Substrings or filenames to match against plugin keys.
+	 * @return bool
+	 */
+	private function demo_has_plugin( $demo_data, $needles ) {
+		return DemoRequirements::has_plugin( $demo_data, $needles );
+	}
+
+	/**
+	 * Whether the imported demo uses Elementor.
+	 *
+	 * @param array $demo_data Demo config.
+	 * @return bool
+	 */
+	private function demo_requires_elementor( $demo_data ) {
+		if ( ! empty( $demo_data['elementor_settings'] ) ) {
+			return true;
+		}
+
+		$pagebuilder = strtolower( (string) ( $demo_data['pagebuilder'] ?? '' ) );
+		if ( false !== strpos( $pagebuilder, 'elementor' ) ) {
+			return true;
+		}
+
+		return $this->demo_has_plugin(
+			$demo_data,
+			array( 'elementor/elementor.php', 'elementor', 'companion-elementor' )
+		);
+	}
+
+	/**
+	 * Whether the imported demo uses WooCommerce.
+	 *
+	 * @param array $demo_data Demo config.
+	 * @return bool
+	 */
+	private function demo_requires_woocommerce( $demo_data ) {
+		return $this->demo_has_plugin( $demo_data, array( 'woocommerce/woocommerce.php', 'woocommerce' ) )
+			|| ! empty( $demo_data['yith_woocommerce_wishlist_settings'] );
+	}
+
+	/**
+	 * Whether the imported demo uses Masteriyo / LMS.
+	 *
+	 * @param array $demo_data Demo config.
+	 * @return bool
+	 */
+	private function demo_requires_masteriyo( $demo_data ) {
+		if ( ! empty( $demo_data['masteriyo_data'] ) ) {
+			return true;
+		}
+
+		return $this->demo_has_plugin(
+			$demo_data,
+			array( 'learning-management-system', 'masteriyo', 'lms.php' )
+		);
+	}
+
+	/**
+	 * Whether the imported demo uses URM and user has selected the plugin to import.
+	 *
+	 * @param array $demo_data Demo config.
+	 * @return bool
+	 */
+	private function demo_requires_urm( $demo_data ) {
+		return DemoRequirements::requires_urm( $demo_data );
+	}
+
+	/**
+	 * Whether the imported demo uses SiteOrigin Page Builder.
+	 *
+	 * @param array $demo_data Demo config.
+	 * @return bool
+	 */
+	private function demo_requires_siteorigin( $demo_data ) {
+		$pagebuilder = strtolower( (string) ( $demo_data['pagebuilder'] ?? '' ) );
+		if ( false !== strpos( $pagebuilder, 'siteorigin' ) ) {
+			return true;
+		}
+
+		return $this->demo_has_plugin(
+			$demo_data,
+			array( 'siteorigin-panels', 'siteorigin' )
+		);
+	}
+
+	/**
+	 * Deferred Elementor kit sync — only when an Elementor demo left a pending flag.
+	 */
+	public function maybe_sync_pending_elementor_kit() {
+		if ( ! get_option( 'themegrill_demo_importer_needs_elementor_kit' ) ) {
+			return;
+		}
+
+		if ( ! in_array( 'elementor/elementor.php', get_option( 'active_plugins', array() ), true ) ) {
+			return;
+		}
+
+		$synced = $this->sync_elementor_active_kit();
+		if ( $synced ) {
+			delete_option( 'themegrill_demo_importer_needs_elementor_kit' );
+		}
+	}
+
+	/**
+	 * Find and set the Elementor active kit from imported library posts.
+	 *
+	 * @return bool True when a kit was found and saved.
+	 */
+	private function sync_elementor_active_kit() {
+		$elementor_version = defined( 'ELEMENTOR_VERSION' ) ? ELEMENTOR_VERSION : false;
+		if ( ! $elementor_version || version_compare( $elementor_version, '3.0.0', '<' ) ) {
+			return false;
+		}
+
+		$query = new WP_Query(
+			array(
+				'post_type'      => 'elementor_library',
+				'posts_per_page' => 50,
+				'fields'         => 'ids',
+				'no_found_rows'  => true,
+			)
+		);
+
+		$found = null;
+		foreach ( $query->posts as $id ) {
+			if ( is_array( get_post_meta( $id, '_elementor_page_settings', true ) ) ) {
+				$found = $id;
+				break;
+			}
+		}
+
+		if ( ! $found ) {
+			return false;
+		}
+
+		update_option( 'elementor_active_kit', $found );
+		if ( class_exists( '\Elementor\Plugin' ) ) {
+			\Elementor\Plugin::$instance->files_manager->clear_cache();
+		}
+
+		return true;
 	}
 
 	public function update_customizer_data() {
@@ -175,8 +294,15 @@ class ImportHooks {
 
 	/**
 	 * Set Elementor Load FontAwesome 4 support.
+	 *
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 */
-	public function set_elementor_load_fa4_shim() {
+	public function set_elementor_load_fa4_shim( $demo_id = '', $demo_data = array() ) {
+		if ( ! $this->demo_requires_elementor( (array) $demo_data ) ) {
+			return;
+		}
+
 		$elementor_load_fa4_shim = get_option( 'elementor_load_fa4_shim' );
 
 		if ( ! $elementor_load_fa4_shim ) {
@@ -186,37 +312,18 @@ class ImportHooks {
 
 	/**
 	 * Set Elementor kit properly.
+	 *
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 */
-	public function set_elementor_active_kit() {
-		$elementor_version = defined( 'ELEMENTOR_VERSION' ) ? ELEMENTOR_VERSION : false;
+	public function set_elementor_active_kit( $demo_id = '', $demo_data = array() ) {
+		if ( ! $this->demo_requires_elementor( (array) $demo_data ) ) {
+			return;
+		}
 
-		if ( version_compare( $elementor_version, '3.0.0', '>=' ) ) {
-			$query = new WP_Query(
-				array(
-					'post_type' => 'elementor_library',
-				)
-			);
-
-			$ids = array_map(
-				function ( $post ) {
-					return $post->ID;
-				},
-				$query->posts
-			);
-
-			$found = null;
-
-			foreach ( $ids as $id ) {
-				if ( is_array( get_post_meta( $id, '_elementor_page_settings', true ) ) ) {
-					$found = $id;
-					break;
-				}
-			}
-
-			if ( $found ) {
-				update_option( 'elementor_active_kit', $found );
-				\Elementor\Plugin::$instance->files_manager->clear_cache();
-			}
+		if ( ! $this->sync_elementor_active_kit() ) {
+			// Elementor may not be fully bootstrapped yet — retry once on next admin load.
+			update_option( 'themegrill_demo_importer_needs_elementor_kit', 1, false );
 		}
 	}
 
@@ -228,9 +335,14 @@ class ImportHooks {
 	 *
 	 * Note: WC pages ID are stored in an option and slug are modified to remove any numbers.
 	 *
-	 * @param string $demo_id
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 */
-	public function set_wc_pages( $demo_id ) {
+	public function set_wc_pages( $demo_id, $demo_data = array() ) {
+		if ( ! $this->demo_requires_woocommerce( (array) $demo_data ) ) {
+			return;
+		}
+
 		if ( class_exists( 'WooCommerce' ) ) {
 
 			global $wpdb;
@@ -315,9 +427,13 @@ class ImportHooks {
 	 *
 	 * Note: Masteriyo pages ID are stored in an option and slug are modified to remove any numbers.
 	 *
-	 * @param string $demo_id
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 */
-	public function set_masteriyo_pages( $demo_id ) {
+	public function set_masteriyo_pages( $demo_id, $demo_data = array() ) {
+		if ( ! $this->demo_requires_masteriyo( (array) $demo_data ) ) {
+			return;
+		}
 
 		if ( function_exists( 'masteriyo' ) ) {
 
@@ -415,8 +531,15 @@ class ImportHooks {
 
 	/**
 	 * Set SiteOrigin PageBuilder Default Setting.
+	 *
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 */
-	public function set_siteorigin_settings() {
+	public function set_siteorigin_settings( $demo_id = '', $demo_data = array() ) {
+		if ( ! $this->demo_requires_siteorigin( (array) $demo_data ) ) {
+			return;
+		}
+
 		$siteorigin_version = defined( 'SITEORIGIN_PANELS_VERSION' ) ? SITEORIGIN_PANELS_VERSION : false;
 
 		if ( version_compare( $siteorigin_version, '2.12.0', '>=' ) ) {
@@ -437,6 +560,14 @@ class ImportHooks {
 	 * @return void
 	 */
 	public function setup_yith_woocommerce_wishlist( $demo_id, $demo_data ) {
+		$settings = DemoConfigValidator::filter_option_map(
+			$demo_data['yith_woocommerce_wishlist_settings'] ?? array(),
+			'yith_woocommerce_wishlist_settings'
+		);
+
+		if ( empty( $settings ) ) {
+			return;
+		}
 
 		if ( ! function_exists( 'YITH_WCWL_Install' ) || YITH_WCWL_Install()->is_installed() ) {
 			return;
@@ -444,7 +575,7 @@ class ImportHooks {
 
 		YITH_WCWL_Install()->init();
 
-		foreach ( $demo_data['yith_woocommerce_wishlist_settings'] as $key => $value ) {
+		foreach ( $settings as $key => $value ) {
 			update_option( $key, $value );
 		}
 	}
@@ -452,9 +583,15 @@ class ImportHooks {
 	/**
 	 * Regenerate elementor styles settings.
 	 *
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
 	 * @return void
 	 */
-	public function regenerate_elementor_styles() {
+	public function regenerate_elementor_styles( $demo_id = '', $demo_data = array() ) {
+		if ( ! $this->demo_requires_elementor( (array) $demo_data ) ) {
+			return;
+		}
+
 		if ( class_exists( 'Elementor\Plugin' ) ) {
 			\Elementor\Plugin::instance()->files_manager->clear_cache();
 		}
@@ -469,6 +606,9 @@ class ImportHooks {
 	 * @return void
 	 */
 	public function update_masteriyo_data( $id, $data ) {
+		if ( ! $this->demo_requires_masteriyo( (array) $data ) ) {
+			return;
+		}
 
 		if ( empty( $data['masteriyo_data'] ) ) {
 			return;
@@ -564,14 +704,15 @@ class ImportHooks {
 			return;
 		}
 
-		// AllFeedback redirects to its Setup Wizard on the next admin page load after activation, so mark it completed to suppress that redirect.
-		update_option( 'allfeedback_wizard_status', 'completed' );
-
 		$survey_data = $data['allfeedback_survey'] ?? $this->default_allfeedback_survey_for_demo( $id );
 
+		// No survey for this demo — do not touch AllFeedback options.
 		if ( empty( $survey_data['title'] ) ) {
 			return;
 		}
+
+		// AllFeedback redirects to its Setup Wizard on the next admin page load after activation, so mark it completed to suppress that redirect.
+		update_option( 'allfeedback_wizard_status', 'completed' );
 
 		$create_request = $this->build_json_rest_request(
 			'POST',
@@ -978,39 +1119,70 @@ class ImportHooks {
 	}
 
 	public function process_evf_posts() {
+		// Only populated when the imported content actually contained Everest Forms
+		// blocks or `[everest_form]` shortcodes.
 		$posts_with_evf = get_option( 'themegrill_demo_importer_posts_with_evf', array() );
 
 		if ( empty( $posts_with_evf ) ) {
 			return;
 		}
 
+		$mapping_data     = get_option( 'themegrill_demo_importer_mapping', array() );
+		$post_mapped_data = $mapping_data['post'] ?? array();
+
+		if ( empty( $post_mapped_data ) ) {
+			delete_option( 'themegrill_demo_importer_posts_with_evf' );
+			return;
+		}
+
 		foreach ( $posts_with_evf as $post_id ) {
 			$post = get_post( $post_id );
 
-			if ( ! $post || ! has_blocks( $post->post_content ) || ! has_block( 'everest-forms/form-selector', $post->post_content ) ) {
+			if ( ! $post || empty( $post->post_content ) ) {
 				continue;
 			}
 
-			$blocks = parse_blocks( $post->post_content );
+			$content           = $post->post_content;
+			$has_evf_block     = has_blocks( $content ) && has_block( 'everest-forms/form-selector', $content );
+			$has_evf_shortcode = (bool) preg_match( '/\[everest_form\b/i', $content );
 
-			if ( empty( $blocks ) ) {
+			if ( ! $has_evf_block && ! $has_evf_shortcode ) {
 				continue;
 			}
 
-			$mapping_data     = get_option( 'themegrill_demo_importer_mapping', array() );
-			$post_mapped_data = $mapping_data['post'] ?? array();
+			$updated = false;
 
-			$this->update_evf_form_ids( $blocks, $post_mapped_data );
+			// Gutenberg form-selector block: remap attrs.formId.
+			if ( $has_evf_block ) {
+				$blocks = parse_blocks( $content );
 
-			// Convert blocks back to post content.
-			$post_content = serialize_blocks( $blocks );
+				if ( ! empty( $blocks ) ) {
+					$this->update_evf_form_ids( $blocks, $post_mapped_data );
+					$content = serialize_blocks( $blocks );
+					$updated = true;
+				}
+			}
 
-			// Update the post content.
+			// Classic / wp:shortcode embeds: remap [everest_form id="…"].
+			// Done on the string so we do not needlessly re-serialize unrelated blocks
+			// (which previously corrupted CSS var(--…) values when wp_slash was missing).
+			if ( preg_match( '/\[everest_form\b/i', $content ) ) {
+				$remapped = $this->remap_evf_form_shortcodes( $content, $post_mapped_data );
+				if ( $remapped !== $content ) {
+					$content = $remapped;
+					$updated = true;
+				}
+			}
+
+			if ( ! $updated ) {
+				continue;
+			}
+
 			wp_update_post(
 				wp_slash(
 					array(
 						'ID'           => $post_id,
-						'post_content' => $post_content,
+						'post_content' => $content,
 					)
 				)
 			);
@@ -1019,12 +1191,45 @@ class ImportHooks {
 		delete_option( 'themegrill_demo_importer_posts_with_evf' );
 	}
 
+	/**
+	 * Remap Everest Forms shortcode IDs using the import post ID map.
+	 *
+	 * @param string $content      Post content.
+	 * @param array  $post_id_map  Demo post ID => local post ID.
+	 * @return string
+	 */
+	public function remap_evf_form_shortcodes( $content, array $post_id_map ) {
+		return (string) preg_replace_callback(
+			'/\[everest_form([^\]]*)\]/i',
+			function ( $matches ) use ( $post_id_map ) {
+				$attrs = $matches[1];
+
+				$attrs = preg_replace_callback(
+					'/(\bid\s*=\s*)(["\']?)(\d+)\2/i',
+					function ( $id_matches ) use ( $post_id_map ) {
+						$old_id = (int) $id_matches[3];
+						if ( ! isset( $post_id_map[ $old_id ] ) ) {
+							return $id_matches[0];
+						}
+
+						$quote = '' !== $id_matches[2] ? $id_matches[2] : '"';
+						return $id_matches[1] . $quote . (int) $post_id_map[ $old_id ] . $quote;
+					},
+					$attrs
+				);
+
+				return '[everest_form' . $attrs . ']';
+			},
+			$content
+		);
+	}
+
 	public function update_evf_form_ids( array &$blocks, array $post_id_map ) {
 		foreach ( $blocks as &$block ) {
 			if ( isset( $block['blockName'] ) ) {
 				if ( 'everest-forms/form-selector' === $block['blockName'] ) {
 					if ( isset( $block['attrs']['formId'] ) ) {
-						$current_form_id = $block['attrs']['formId'];
+						$current_form_id = (int) $block['attrs']['formId'];
 						if ( isset( $post_id_map[ $current_form_id ] ) ) {
 							$block['attrs']['formId'] = (string) $post_id_map[ $current_form_id ];
 						}
@@ -1035,6 +1240,133 @@ class ImportHooks {
 				}
 			}
 		}
+	}
+
+	public function process_membership_buy_now_posts() {
+		$posts_with_membership_buy_now = get_option( 'themegrill_demo_importer_posts_with_membership_buy_now', array() );
+
+		if ( empty( $posts_with_membership_buy_now ) ) {
+			return;
+		}
+
+		$mapping_data     = get_option( 'themegrill_demo_importer_mapping', array() );
+		$post_mapped_data = $mapping_data['post'] ?? array();
+
+		if ( empty( $post_mapped_data ) ) {
+			delete_option( 'themegrill_demo_importer_posts_with_membership_buy_now' );
+			return;
+		}
+
+		foreach ( $posts_with_membership_buy_now as $post_id ) {
+			$post = get_post( $post_id );
+
+			if ( ! $post || empty( $post->post_content ) || ! has_blocks( $post->post_content ) || ! has_block( 'user-registration/membership-buy-now', $post->post_content ) ) {
+				continue;
+			}
+
+			$blocks = parse_blocks( $post->post_content );
+
+			if ( empty( $blocks ) ) {
+				continue;
+			}
+
+			$this->update_membership_buy_now_ids( $blocks, $post_mapped_data );
+			wp_update_post(
+				wp_slash(
+					array(
+						'ID'           => $post_id,
+						'post_content' => serialize_blocks( $blocks ),
+					)
+				)
+			);
+		}
+
+		delete_option( 'themegrill_demo_importer_posts_with_membership_buy_now' );
+	}
+
+	public function update_membership_buy_now_ids( array &$blocks, array $post_id_map ) {
+		foreach ( $blocks as &$block ) {
+			if ( isset( $block['blockName'] ) ) {
+				if ( 'user-registration/membership-buy-now' === $block['blockName'] ) {
+					if ( isset( $block['attrs']['membershipId'] ) ) {
+						$current_membership_id = (int) $block['attrs']['membershipId'];
+						if ( isset( $post_id_map[ $current_membership_id ] ) ) {
+							$block['attrs']['membershipId'] = (string) $post_id_map[ $current_membership_id ];
+						}
+					}
+				}
+				if ( ! empty( $block['innerBlocks'] ) ) {
+					$this->update_membership_buy_now_ids( $block['innerBlocks'], $post_id_map );
+				}
+			}
+		}
+	}
+
+	public function process_allcoach_add_to_cart_posts() {
+		$posts_with_allcoach_cart = get_option( 'themegrill_demo_importer_posts_with_allcoach_cart', array() );
+
+		if ( empty( $posts_with_allcoach_cart ) ) {
+			return;
+		}
+
+		$mapping_data     = get_option( 'themegrill_demo_importer_mapping', array() );
+		$post_mapped_data = $mapping_data['post'] ?? array();
+
+		if ( empty( $post_mapped_data ) ) {
+			delete_option( 'themegrill_demo_importer_posts_with_allcoach_cart' );
+			return;
+		}
+
+		foreach ( $posts_with_allcoach_cart as $post_id ) {
+			$post = get_post( $post_id );
+
+			if ( ! $post || empty( $post->post_content ) ) {
+				continue;
+			}
+
+			$remapped = $this->remap_allcoach_add_to_cart_links( $post->post_content, $post_mapped_data );
+
+			if ( $remapped === $post->post_content ) {
+				continue;
+			}
+
+			wp_update_post(
+				wp_slash(
+					array(
+						'ID'           => $post_id,
+						'post_content' => $remapped,
+					)
+				)
+			);
+		}
+
+		delete_option( 'themegrill_demo_importer_posts_with_allcoach_cart' );
+	}
+
+	/**
+	 * Remap `allcoach-add-to-cart` query-string program IDs using the import post ID map.
+	 *
+	 * Done on the raw string because the
+	 * program ID lives in a plain `<a href="…?allcoach-add-to-cart=123">` link baked
+	 * into the button block's inner markup, not in the block's `attrs` JSON.
+	 *
+	 * @param string $content     Post content.
+	 * @param array  $post_id_map Demo post ID => local post ID.
+	 * @return string
+	 */
+	public function remap_allcoach_add_to_cart_links( $content, array $post_id_map ) {
+		return (string) preg_replace_callback(
+			'/\ballcoach-add-to-cart=(\d+)/i',
+			function ( $matches ) use ( $post_id_map ) {
+				$old_id = (int) $matches[1];
+				if ( ! isset( $post_id_map[ $old_id ] ) ) {
+					return $matches[0];
+				}
+
+				return 'allcoach-add-to-cart=' . (int) $post_id_map[ $old_id ];
+			},
+			$content
+		);
 	}
 
 	public function themegrill_update_block_term_ids( array &$blocks, array $term_id_map ) {
@@ -1068,9 +1400,20 @@ class ImportHooks {
 						}
 					}
 
-					// Recursively update inner blocks
-					if ( ! empty( $block['innerBlocks'] ) ) {
-						$this->themegrill_update_block_term_ids( $block['innerBlocks'], $term_id_map );
+				}
+				if ( 'woocommerce/featured-category' === $block['blockName'] ) {
+					if ( isset( $block['attrs']['categoryId'] ) && isset( $term_id_map[ $block['attrs']['categoryId'] ] ) ) {
+						$block['attrs']['categoryId'] = (int) $term_id_map[ $block['attrs']['categoryId'] ];
+					}
+				}
+				if ( 'woocommerce/product-category' === $block['blockName'] ) {
+					if ( isset( $block['attrs']['categories'] ) && is_array( $block['attrs']['categories'] ) ) {
+						$block['attrs']['categories'] = array_map(
+							function ( $cat_id ) use ( $term_id_map ) {
+								return isset( $term_id_map[ $cat_id ] ) ? (int) $term_id_map[ $cat_id ] : (int) $cat_id;
+							},
+							$block['attrs']['categories']
+						);
 					}
 				}
 				if ( 'core/group' === $block['blockName'] ) {
@@ -1100,18 +1443,340 @@ class ImportHooks {
 					}
 				}
 			}
+
+			// Recurse into inner blocks regardless of the parent block type so that
+			// nested blocks (e.g. inside core/columns, core/cover, core/group) are reached.
+			if ( ! empty( $block['innerBlocks'] ) ) {
+				$this->themegrill_update_block_term_ids( $block['innerBlocks'], $term_id_map );
+			}
 		}
 	}
 
 	public function update_elementor_settings( $id, $data ) {
-		$settings = $data['elementor_settings'] ?? array();
-
-		if ( empty( $settings ) ) {
+		if ( ! $this->demo_requires_elementor( (array) $data ) ) {
 			return;
 		}
+
+		$settings = DemoConfigValidator::filter_option_map( $data['elementor_settings'] ?? array(), 'elementor_settings' );
 
 		foreach ( $settings as $key => $value ) {
 			update_option( $key, $value );
 		}
 	}
+
+	/**
+	 * Find the registration form ID referenced inside a page's content, whether it's embedded as
+	 * the classic [user_registration_form id="X"] shortcode or the registration-form block.
+	 *
+	 * @param string $content Page post_content.
+	 * @return int Form post ID, or 0 if none found.
+	 */
+	private function extract_urm_registration_form_id( $content ) {
+		if ( empty( $content ) ) {
+			return 0;
+		}
+
+		if ( function_exists( 'has_blocks' ) && has_blocks( $content ) ) {
+			$form_id = $this->find_urm_form_id_in_blocks( parse_blocks( $content ) );
+
+			if ( $form_id ) {
+				return $form_id;
+			}
+		}
+
+		$shortcode_tag = apply_filters( 'user_registration_form_shortcode_tag', 'user_registration_form' );
+
+		if ( preg_match( '/\[\s*' . preg_quote( $shortcode_tag, '/' ) . '\b[^\]]*\bid=["\']?(\d+)/', $content, $matches ) ) {
+			return (int) $matches[1];
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Recursively search parsed blocks for a user-registration/registration-form block's formId.
+	 *
+	 * @param array $blocks Parsed blocks.
+	 * @return int Form post ID, or 0 if none found.
+	 */
+	private function find_urm_form_id_in_blocks( $blocks ) {
+		foreach ( $blocks as $block ) {
+			if ( isset( $block['blockName'] ) && 'user-registration/registration-form' === $block['blockName'] && ! empty( $block['attrs']['formId'] ) ) {
+				return (int) $block['attrs']['formId'];
+			}
+
+			if ( ! empty( $block['innerBlocks'] ) ) {
+				$found = $this->find_urm_form_id_in_blocks( $block['innerBlocks'] );
+
+				if ( $found ) {
+					return $found;
+				}
+			}
+		}
+
+		return 0;
+	}
+
+	/**
+	 * Set User Registration and Membership pages properly and disable setup wizard redirect.
+	 *
+	 * After importing demo data filter out duplicate URM pages and set them properly.
+	 * Happens when the user run default URM setup wizard during installation.
+	 *
+	 * Note: URM pages ID are stored in an option and slug are modified to remove any numbers.
+	 *
+	 * @param string $demo_id   Demo id.
+	 * @param array  $demo_data Demo config.
+	 */
+	public function set_urm_pages( $demo_id, $demo_data = array() ) {
+		if ( ! $this->demo_requires_urm( (array) $demo_data ) ) {
+			return;
+		}
+
+		if ( function_exists( 'UR' ) ) {
+
+			global $wpdb;
+
+			// Form referenced by the imported Registration/Membership Registration page, if any.
+			$matched_form_id = 0;
+
+			$urm_pages = apply_filters(
+				'themegrill_urm_' . $demo_id . '_pages',
+				array(
+					'login'            => array(
+						'name'         => 'login',
+						'title'        => 'Login',
+						'setting_name' => 'login_page_id',
+					),
+					'registration'    => array(
+						'name'         => 'registration',
+						'title'        => 'Registration',
+						'setting_name' => 'registration_page_id',
+					),
+					'lost-password'                 => array(
+						'name'         => 'lost-password',
+						'title'        => 'Lost Password',
+						'setting_name' => 'lost_password_page_id',
+					),
+					'membership-registration'                => array(
+						'name'         => 'membership-registration',
+						'title'        => 'Membership Registration',
+						'setting_name' => 'member_registration_page_id',
+					),
+					'membership-thankyou'                   => array(
+						'name'         => 'membership-thankyou',
+						'title'        => 'Membership Thank You',
+						'setting_name' => 'thank_you_page_id',
+					),
+					'my-account' => array(
+						'name'         => 'my-account',
+						'title'        => 'My Account',
+						'setting_name' => 'myaccount_page_id',
+					),
+					'membership-pricing'        => array(
+						'name'         => 'membership-pricing',
+						'title'        => 'Membership Pricing',
+						'setting_name' => 'membership_pricing_page_id',
+					),
+				)
+			);
+
+			// Set URM pages properly.
+			foreach ( $urm_pages as $key => $urm_page ) {
+
+				// Get the ID of every page with matching name or title.
+				$page_ids = $wpdb->get_results( $wpdb->prepare( "SELECT ID FROM $wpdb->posts WHERE (post_name = %s OR post_title = %s) AND post_type = 'page' AND post_status = 'publish'", $urm_page['name'], $urm_page['title'] ) );
+
+				if ( ! is_null( $page_ids ) ) {
+
+					$page_id    = 0;
+					$delete_ids = array();
+
+					// Retrieve page with greater id and delete others.
+					if ( count( $page_ids ) > 1 ) {
+
+						foreach ( $page_ids as $page ) {
+							if ( $page->ID > $page_id ) {
+								if ( $page_id ) {
+									$delete_ids[] = $page_id;
+								}
+
+								$page_id = $page->ID;
+							} else {
+								$delete_ids[] = $page->ID;
+							}
+						}
+					} else {
+						$page_id = ! empty( $page_ids ) ? $page_ids[0]->ID : 0;
+					}
+
+					// Delete posts.
+					foreach ( $delete_ids as $delete_id ) {
+						wp_delete_post( $delete_id, true );
+					}
+
+					// Update URM page.
+					if ( $page_id > 0 ) {
+						wp_update_post(
+							array(
+								'ID'        => $page_id,
+								'post_name' => sanitize_title( $urm_page['name'] ),
+							)
+						);
+
+						$setting_name = $urm_page['setting_name'];
+						update_option( "user_registration_{$setting_name}", $page_id );
+
+						if ( 'login' === $key ) {
+							update_option( 'user_registration_login_options_login_redirect_url', $page_id );
+						}
+
+						if ( in_array( $key, array( 'registration', 'membership-registration' ), true ) ) {
+							update_option( 'user_registration_member_registration_page_id', $page_id );
+
+							$page_form_id = $this->extract_urm_registration_form_id( get_post_field( 'post_content', $page_id ) );
+
+							if ( $page_form_id > 0 ) {
+								$matched_form_id = $page_form_id;
+							}
+						}
+					}
+				}
+			}
+
+			// Prefer the matched page's own form over guessing the highest post ID site-wide.
+			$default_form_id = $matched_form_id;
+
+			if ( ! $default_form_id ) {
+				$form_ids        = $wpdb->get_col( "SELECT ID FROM $wpdb->posts WHERE post_type = 'user_registration' AND post_status = 'publish' ORDER BY ID DESC" );
+				$default_form_id = ! empty( $form_ids ) ? (int) $form_ids[0] : 0;
+			}
+
+			if ( $default_form_id ) {
+				update_option( 'user_registration_default_form_page_id', $default_form_id );
+				update_option( 'user_registration_registration_form', $default_form_id );
+			}
+
+			// enable registration.
+			update_option( 'users_can_register', true );
+
+			// Setup wizard was never run, so mark it as handled to prevent the "wizard was skipped" nag notice.
+			update_option( 'user_registration_first_time_activation_flag', false );
+
+			$enabled_features = get_option( 'user_registration_enabled_features', array() );
+
+			if ( ! in_array( 'user-registration-membership', $enabled_features, true ) ) {
+				$enabled_features[] = 'user-registration-membership';
+				update_option( 'user_registration_enabled_features', $enabled_features );
+			}
+
+			$this->set_urm_settings( (array) $demo_data );
+
+			delete_transient( '_ur_activation_redirect' );
+		}
+	}
+
+	/**
+	 * Set URM settings from the demo config.
+	 *
+	 * @param array $demo_data Demo config.
+	 */
+	private function set_urm_settings( $demo_data ) {
+		$settings = DemoConfigValidator::filter_option_map(
+			$demo_data['urm_settings'] ?? array(),
+			'urm_settings'
+		);
+
+		if ( empty( $settings ) ) {
+			return;
+		}
+
+		if ( isset( $settings['urm_bank_connection_status'] ) ) {
+			$enabled = function_exists( 'ur_string_to_bool' )
+				? ur_string_to_bool( $settings['urm_bank_connection_status'] )
+				: (bool) $settings['urm_bank_connection_status'];
+
+			update_option( 'urm_bank_connection_status', $enabled );
+		}
+
+		if ( isset( $settings['user_registration_bank_enabled'] ) ) {
+			$enabled = function_exists( 'ur_string_to_bool' )
+				? ur_string_to_bool( $settings['user_registration_bank_enabled'] )
+				: (bool) $settings['user_registration_bank_enabled'];
+
+			update_option( 'user_registration_bank_enabled', $enabled );
+		}
+
+		if ( isset( $settings['user_registration_global_bank_details'] ) ) {
+			update_option( 'user_registration_global_bank_details', wp_kses_post( $settings['user_registration_global_bank_details'] ) );
+		}
+
+		if ( isset( $settings['user_registration_content_restriction_message'] ) ) {
+			$message = $this->replace_demo_links_in_html( $settings['user_registration_content_restriction_message'] );
+			update_option( 'user_registration_content_restriction_message', wp_kses_post( $message ) );
+		}
+
+		if ( isset( $settings['user_registration_payment_currency'] ) ) {
+			$currency   = sanitize_text_field( $settings['user_registration_payment_currency'] );
+			$currencies = function_exists( 'ur_payment_integration_get_currencies' ) ? ur_payment_integration_get_currencies() : array();
+
+			if ( empty( $currencies ) || isset( $currencies[ $currency ] ) ) {
+				update_option( 'user_registration_payment_currency', $currency ? $currency : 'USD' );
+			}
+		}
+	}
+
+	/**
+	 * Rewrites href="..." links inside an HTML snippet that aren't on this site's own host to point here instead.
+	 *
+	 * @param  string $content HTML content.
+	 * @return string
+	 */
+	private function replace_demo_links_in_html( $content ) {
+		if ( ! is_string( $content ) || '' === $content || false === stripos( $content, 'href' ) ) {
+			return $content;
+		}
+
+		return preg_replace_callback(
+			'#\bhref=([\'"])(https?://[^\'"]+)\1#i',
+			function ( $matches ) {
+				return 'href=' . $matches[1] . $this->rewrite_demo_url( $matches[2] ) . $matches[1];
+			},
+			$content
+		);
+	}
+
+	/**
+	 * Rewrites a URL not on this site's own host, stripping the assumed demo host + subdirectory slug.
+	 *
+	 * @param  string $url URL to rewrite.
+	 * @return string
+	 */
+	private function rewrite_demo_url( $url ) {
+		$parsed = wp_parse_url( $url );
+		if ( empty( $parsed['host'] ) ) {
+			return $url;
+		}
+
+		$host      = preg_replace( '/^www\./i', '', strtolower( $parsed['host'] ) );
+		$site_host = preg_replace( '/^www\./i', '', strtolower( (string) wp_parse_url( home_url(), PHP_URL_HOST ) ) );
+
+		if ( $host === $site_host ) {
+			return $url;
+		}
+
+		$path = isset( $parsed['path'] ) ? preg_replace( '/^\/[^\/]+/', '', $parsed['path'] ) : '';
+
+		$new_url = untrailingslashit( home_url() ) . $path;
+
+		if ( ! empty( $parsed['query'] ) ) {
+			$new_url .= '?' . $parsed['query'];
+		}
+		if ( ! empty( $parsed['fragment'] ) ) {
+			$new_url .= '#' . $parsed['fragment'];
+		}
+
+		return $new_url;
+	}
+
 }

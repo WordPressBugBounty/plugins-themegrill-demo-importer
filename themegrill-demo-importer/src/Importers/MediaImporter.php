@@ -50,14 +50,20 @@ class MediaImporter {
 		foreach ( $batch as $attachment ) {
 			$new_post_id = $this->process_single( $attachment );
 			if ( ! $new_post_id || is_wp_error( $new_post_id ) ) {
+				// Left unresolved, the demo's original (often stale/staging) URL stays
+				// baked into post_content and _elementor_data - log which one and why,
+				// so a dead demo-asset host shows up here instead of only as a missing
+				// image/video on the front end.
+				$reason = is_wp_error( $new_post_id ) ? $new_post_id->get_error_message() : 'unknown error';
+				$this->logger->warning( 'Skipped attachment ' . ( $attachment['original_url'] ?? '' ) . ': ' . $reason );
 				continue;
 			}
 
-			$original_id = $attachment['original_id'];
-			$remote_url  = $attachment['remote_url'];
+			$original_id  = $attachment['original_id'];
+			$original_url = $attachment['original_url'];
 
 			$mapping['post'][ $original_id ] = $new_post_id;
-			$url_remap[ $remote_url ]        = wp_get_attachment_url( $new_post_id );
+			$url_remap[ $original_url ]      = wp_get_attachment_url( $new_post_id );
 
 			// Track for cleanup on reset.
 			$imported_posts   = get_option( 'themegrill_demo_importer_imported_posts', array() );
@@ -121,7 +127,8 @@ class MediaImporter {
 			return new WP_Error( 'upload_dir_error', $upload['error'] );
 		}
 
-		$response = wp_remote_get(
+		// Safe remote fetch: blocks private/loopback SSRF targets.
+		$response = \ThemeGrill\Demo\Importer\Helpers\RemoteRequest::get(
 			$remote_url,
 			array(
 				'stream'    => true,
@@ -231,7 +238,6 @@ class MediaImporter {
 		}
 
 		// Clean up temporary options.
-		delete_option( 'themegrill_demo_importer_url_remap' );
 		delete_option( 'themegrill_demo_importer_featured_images' );
 		delete_option( 'themegrill_demo_importer_media_total' );
 		delete_option( 'themegrill_demo_importer_pending_attachments' );
